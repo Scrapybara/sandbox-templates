@@ -7,7 +7,7 @@ import asyncio
 import os
 from abc import ABCMeta, abstractmethod
 from dataclasses import dataclass, fields, replace
-from typing import Any, ClassVar, Dict, List, Literal, Optional, Set, Tuple, Union
+from typing import Any, ClassVar, Dict, List, Literal, Optional, Set, Tuple
 import re
 
 from fastapi import FastAPI, HTTPException
@@ -423,6 +423,7 @@ class BashTool(BaseAnthropicTool):
 
     def __init__(self):
         self._sessions = {}
+        self._sessions_lock = asyncio.Lock() # Lock to protect concurrent access when multiple requests manipulate sessions
         super().__init__()
 
     async def __call__(
@@ -465,13 +466,14 @@ class BashTool(BaseAnthropicTool):
         if restart:
             session_id = session if session is not None else 1
             try:
-                if session_id in self._sessions:
-                    try:
-                        self._sessions[session_id].stop()
-                    except Exception:
-                        pass
-                self._sessions[session_id] = _BashSession(session_id=session_id)
-                await self._sessions[session_id].start()
+                async with self._sessions_lock:
+                    if session_id in self._sessions:
+                        try:
+                            self._sessions[session_id].stop()
+                        except Exception:
+                            pass
+                    self._sessions[session_id] = _BashSession(session_id=session_id)
+                    await self._sessions[session_id].start()
                 return ToolResult(system=f"Session {session_id} has been restarted.")
             except Exception as e:
                 return ToolResult(error=f"Failed to restart session {session_id}: {str(e)}")
@@ -494,10 +496,11 @@ class BashTool(BaseAnthropicTool):
             
         created_msg = None
         try:
-            if session not in self._sessions:                
-                self._sessions[session] = _BashSession(session_id=session)
-                await self._sessions[session].start()
-                created_msg = f"Created new session with ID: {session}"
+            async with self._sessions_lock:
+                if session not in self._sessions:
+                    self._sessions[session] = _BashSession(session_id=session)
+                    await self._sessions[session].start()
+                    created_msg = f"Created new session with ID: {session}"
         except Exception as e:
             return ToolResult(error=f"Failed to create session {session}: {str(e)}")
             
@@ -518,10 +521,11 @@ class BashTool(BaseAnthropicTool):
                     (result.error and "0 bytes read on a total of undefined expected bytes" in result.error)
                 ):
                     try:
-                        current_session.stop()
-                        self._sessions[session] = _BashSession(session_id=session)
-                        await self._sessions[session].start()
-                        current_session = self._sessions[session]
+                        async with self._sessions_lock:
+                            current_session.stop()
+                            self._sessions[session] = _BashSession(session_id=session)
+                            await self._sessions[session].start()
+                            current_session = self._sessions[session]
                         
                         result = await current_session.run(command, timeout)
                         
