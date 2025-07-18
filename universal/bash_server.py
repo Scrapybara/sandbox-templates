@@ -7,8 +7,7 @@ import asyncio
 import os
 from abc import ABCMeta, abstractmethod
 from dataclasses import dataclass, fields, replace
-from typing import Any, ClassVar, Dict, List, Literal, Optional, Set, Tuple
-import re
+from typing import Any, ClassVar, Dict, List, Literal, Optional, Tuple
 
 from fastapi import FastAPI, HTTPException
 from fastapi.staticfiles import StaticFiles
@@ -138,30 +137,8 @@ class _BashSession:
         return False
 
     def _process_output(self, output: str, prev_dir: str) -> Tuple[str, List[str]]:
-        """Process command output to handle directory changes and file events."""
+        """Process command output to handle directory changes."""
         system_messages: List[str] = []
-        raw_created: Set[str] = set()
-        raw_deleted: Set[str] = set()
-
-        # Extract and parse the multi-line FILE_EVENTS block
-        events_pattern = r'FILE_EVENTS:\s*created=\[(.*?)\]\s*deleted=\[(.*?)\]'
-        match = re.search(events_pattern, output, flags=re.S)
-        if match:
-            created_blob = match.group(1).strip()
-            deleted_blob = match.group(2).strip()
-            
-            raw_created = set(f for f in created_blob.split() if f)
-            raw_deleted = set(f for f in deleted_blob.split() if f)
-
-            if raw_created:
-                joined = ' '.join(sorted(raw_created))
-                system_messages.append(f'Created files: {joined}')
-
-            if raw_deleted:
-                joined = ' '.join(sorted(raw_deleted))
-                system_messages.append(f'Removed files: {joined}')
-
-            output = output[:match.start()] + output[match.end():]
 
         # Handle working directory changes
         lines = output.split('\n')
@@ -171,9 +148,10 @@ class _BashSession:
             self._current_directory = new_dir
             system_messages.append(f'Current directory: {new_dir}')
 
+        # Remove any CWD_CHANGE marker lines from the output
         output = '\n'.join(
             l for l in lines
-            if not l.startswith(('FILE_EVENTS:', 'CWD_CHANGE:'))
+            if not l.startswith('CWD_CHANGE:')
         ).rstrip('\n')
 
         return output, system_messages
@@ -325,16 +303,6 @@ class _BashSession:
         wrapped_command = f"""
 {command}
 
-# Detect file changes if in a git repo
-if [ -d .git ]; then
-    created=$(git ls-files --others --exclude-standard 2>/dev/null || echo "")
-    deleted=$(git ls-files --deleted 2>/dev/null || echo "")
-else
-    created=""
-    deleted=""
-fi
-
-echo "FILE_EVENTS: created=[$created] deleted=[$deleted]"
 echo "CWD_CHANGE: $(pwd)"
 echo '{self._sentinel}'
 """
