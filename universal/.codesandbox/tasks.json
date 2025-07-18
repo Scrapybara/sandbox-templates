@@ -1,12 +1,28 @@
 {
   // These tasks will run in order when initializing your CodeSandbox project.
   "setupTasks": [
-    {
-      "name": "Start Bash Tool Server",
-      "command": "cd /project/workspace && python bash_server.py &"
-    }
+    // {
+    //   "name": "Start Bash Tool Server",
+    //   "command": "cd /project/workspace && python bash_server.py &",
+    //   "preview": {
+    //     "port": 8000
+    //   }
+    // }
   ],
 
   // These tasks can be run from CodeSandbox. Running one will open a log in the app.
-  "tasks": {}
+  "tasks": {
+    "bash": {
+      "name": "start bash tool server",
+      "command": "cd /project/workspace && uvicorn bash_server:app --host 0.0.0.0 --port 8000 --reload",
+      "runAtStart": true,
+      "preview": {
+        "port": 8000
+      },
+      "restartOn": {
+        "clone": true,
+        "resume": true
+      }
+    }
+  }
 }
