@@ -14,7 +14,7 @@
   "tasks": {
     "bash": {
       "name": "start bash tool server",
-      "command": "cd /project/workspace && uvicorn bash_server:app --host 0.0.0.0 --port 8000 --reload",
+      "command": "cd /project/workspace && uvicorn bash_server:app --reload",
       "runAtStart": true,
       "preview": {
         "port": 8000
