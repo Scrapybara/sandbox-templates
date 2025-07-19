@@ -1,20 +1,39 @@
 #!/usr/bin/env python3
 """
-FastAPI server providing a Bash tool endpoint
+FastAPI server providing Bash and File tool endpoints
 """
 
 import asyncio
 import os
+import re
+import base64
+import shutil
+import inspect
 from abc import ABCMeta, abstractmethod
+from collections import defaultdict
 from dataclasses import dataclass, fields, replace
-from typing import Any, ClassVar, Dict, List, Literal, Optional, Tuple
+from typing import Any, ClassVar, Dict, List, Literal, Optional, Tuple, get_args
 
 from fastapi import FastAPI, HTTPException
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import uvicorn
 from pathlib import Path
+
+
+# Command types for file operations
+Command = Literal[
+    "read", "write", "append", "delete", "exists", "list", "mkdir", "rmdir", "move", "copy",
+    "view", "create", "replace", "insert", "delete_lines", "undo", "grep"
+]
+
+
+def _shorten(text: str, limit: int = 120) -> str:
+    """Return *text* truncated to *limit* chars, escaping newlines for readability."""
+    text = text.replace("\n", "\\n")
+    return text if len(text) <= limit else text[:limit] + "..."
 
 
 # Base classes and data structures
@@ -391,7 +410,7 @@ class BashTool(BaseAnthropicTool):
 
     def __init__(self):
         self._sessions = {}
-        self._sessions_lock = asyncio.Lock() # Lock to protect concurrent access when multiple requests manipulate sessions
+        self._sessions_lock = asyncio.Lock()
         super().__init__()
 
     async def __call__(
@@ -540,21 +559,442 @@ class BashTool(BaseAnthropicTool):
         raise ToolError("no command provided.")
 
 
+# File Tool implementation
+class FileTool(BaseAnthropicTool):
+    """
+    A filesystem editor tool that allows the agent to view, create, and edit files.
+    """
+
+    name: ClassVar[Literal["file"]] = "file"
+    _file_history: Dict[Path, List[str]]  # Undo history for text edits
+
+    def __init__(self, base_path: Path | None = None):
+        self._file_history = defaultdict(list)
+        self.base_path = base_path or Path.cwd()
+        if not self.base_path.exists():
+            self.base_path.mkdir(parents=True, exist_ok=True)
+        super().__init__()
+    
+    def _validate_path(self, path: str) -> Path:
+        try:
+            path_obj = Path(path)
+            full_path = path_obj if path_obj.is_absolute() else (self.base_path / path_obj).resolve()
+            # Allow access to the entire workspace area
+            if not str(full_path).startswith(str(self.base_path)):
+                raise ToolError("Path is outside the allowed base directory")
+            return full_path
+        except Exception as e:
+            raise ToolError(f"Invalid path: {str(e)}")
+        
+    async def __call__(self, command: Command, **kwargs) -> ToolResult:
+        try:
+            if command not in get_args(Command):
+                raise ToolError(f"Unsupported command: {command}. Supported commands: {', '.join(get_args(Command))}")
+            
+            method_map = {
+                "read": self.read, "write": self.write, "append": self.append, "delete": self.delete,
+                "exists": self.exists, "list": self.list_dir, "mkdir": self.mkdir, "rmdir": self.rmdir,
+                "move": self.move, "copy": self.copy, "view": self.view, "create": self.create,
+                "replace": self.replace, "insert": self.insert, "delete_lines": self.delete_lines,
+                "undo": self.undo, "grep": self.grep
+            }
+            
+            if command not in method_map:
+                raise ToolError(f"Command '{command}' is valid but not implemented")
+                
+            method = method_map[command]
+            
+            # Filter kwargs to only include parameters that the method accepts
+            sig = inspect.signature(method)
+            valid_params = set(sig.parameters.keys())
+            filtered_kwargs = {k: v for k, v in kwargs.items() if k in valid_params}
+            
+            return await method(**filtered_kwargs)
+        except ToolError as e:
+            return ToolResult(error=str(e))
+        except Exception as e:
+            return ToolResult(error=f"Unexpected error: {str(e)}")
+
+    async def read(self, path: str, mode: str = "text", encoding: str = "utf-8", line_numbers: bool = True) -> ToolResult:
+        """Read the content of a file in text or binary mode."""
+        full_path = self._validate_path(path)
+        if not full_path.is_file():
+            raise ToolError("Path is not a file")
+        try:
+            if mode == "text":
+                content = full_path.read_text(encoding=encoding)
+                if line_numbers:
+                    numbered_content = "\n".join(
+                        f"{str(i + 1).rjust(6)}\t{line}" for i, line in enumerate(content.splitlines())
+                    )
+                    return ToolResult(output=numbered_content)
+                return ToolResult(output=content)
+            elif mode == "binary":
+                content = base64.b64encode(full_path.read_bytes()).decode()
+                return ToolResult(output=content, system="binary")
+            else:
+                raise ToolError("Invalid mode: choose 'text' or 'binary'")
+        except Exception as e:
+            raise ToolError(f"Failed to read file: {str(e)}")
+
+    async def write(self, path: str, content: str, mode: str = "text", encoding: str = "utf-8") -> ToolResult:
+        """Write content to a file, overwriting if it exists."""
+        full_path = self._validate_path(path)
+        try:
+            full_path.parent.mkdir(parents=True, exist_ok=True)
+            if mode == "text":
+                full_path.write_text(content, encoding=encoding)
+            elif mode == "binary":
+                full_path.write_bytes(base64.b64decode(content))
+            else:
+                raise ToolError("Invalid mode: choose 'text' or 'binary'")
+            return ToolResult(output=f"File written to {path}")
+        except Exception as e:
+            raise ToolError(f"Failed to write file: {str(e)}")
+
+    async def append(self, path: str, content: str, mode: str = "text", encoding: str = "utf-8") -> ToolResult:
+        """Append content to an existing file or create it if it doesn't exist."""
+        full_path = self._validate_path(path)
+        try:
+            if mode == "text":
+                with full_path.open('a', encoding=encoding) as f:
+                    f.write(content)
+            elif mode == "binary":
+                decoded_content = base64.b64decode(content)
+                with full_path.open('ab') as f:
+                    f.write(decoded_content)
+            else:
+                raise ToolError("Invalid mode: choose 'text' or 'binary'")
+            return ToolResult(output=f"Appended to file {path}")
+        except Exception as e:
+            raise ToolError(f"Failed to append to file: {str(e)}")
+
+    async def delete(self, path: str, recursive: bool = False) -> ToolResult:
+        """Delete a file or directory, optionally recursively."""
+        full_path = self._validate_path(path)
+        try:
+            if full_path.is_file():
+                full_path.unlink()
+            elif full_path.is_dir():
+                if recursive:
+                    shutil.rmtree(full_path)
+                else:
+                    full_path.rmdir()
+            else:
+                raise ToolError("Path does not exist")
+            self._file_history.pop(full_path, None)  # Clear undo history
+            return ToolResult(output=f"Deleted {path}")
+        except Exception as e:
+            raise ToolError(f"Failed to delete: {str(e)}")
+
+    async def exists(self, path: str) -> ToolResult:
+        """Check if a path exists."""
+        try:
+            full_path = self._validate_path(path)
+            exists = full_path.exists()
+            return ToolResult(output=str(exists))
+        except Exception as e:
+            return ToolResult(error=f"Failed to check existence: {str(e)}")
+
+    async def list_dir(self, path: str) -> ToolResult:
+        """List the contents of a directory."""
+        full_path = self._validate_path(path)
+        if not full_path.is_dir():
+            raise ToolError("Path is not a directory")
+        try:
+            contents = []
+            for p in sorted(full_path.iterdir()):
+                if p.is_dir():
+                    contents.append(f"{p.name}/")
+                else:
+                    contents.append(p.name)
+            return ToolResult(output="\n".join(contents))
+        except Exception as e:
+            raise ToolError(f"Failed to list directory: {str(e)}")
+
+    async def mkdir(self, path: str) -> ToolResult:
+        """Create a directory, including parent directories if needed."""
+        full_path = self._validate_path(path)
+        try:
+            full_path.mkdir(parents=True, exist_ok=True)
+            return ToolResult(output=f"Directory created: {path}")
+        except Exception as e:
+            raise ToolError(f"Failed to create directory: {str(e)}")
+
+    async def rmdir(self, path: str) -> ToolResult:
+        """Remove an empty directory."""
+        full_path = self._validate_path(path)
+        try:
+            full_path.rmdir()
+            return ToolResult(output=f"Directory removed: {path}")
+        except Exception as e:
+            raise ToolError(f"Failed to remove directory: {str(e)}")
+
+    async def move(self, src: str, dst: str) -> ToolResult:
+        """Move or rename a file or directory."""
+        src_path = self._validate_path(src)
+        dst_path = self._validate_path(dst)
+        try:
+            dst_path.parent.mkdir(parents=True, exist_ok=True)
+            src_path.rename(dst_path)
+            if src_path in self._file_history:
+                self._file_history[dst_path] = self._file_history.pop(src_path)
+            return ToolResult(output=f"Moved {src} to {dst}")
+        except Exception as e:
+            raise ToolError(f"Failed to move: {str(e)}")
+
+    async def copy(self, src: str, dst: str) -> ToolResult:
+        """Copy a file or directory."""
+        src_path = self._validate_path(src)
+        dst_path = self._validate_path(dst)
+        try:
+            dst_path.parent.mkdir(parents=True, exist_ok=True)
+            if src_path.is_file():
+                shutil.copy2(src_path, dst_path)
+            elif src_path.is_dir():
+                shutil.copytree(src_path, dst_path)
+            else:
+                raise ToolError("Source path does not exist")
+            return ToolResult(output=f"Copied {src} to {dst}")
+        except Exception as e:
+            raise ToolError(f"Failed to copy: {str(e)}")
+
+    async def view(
+        self,
+        path: str,
+        view_range: Optional[List[int]] = None,
+        line_numbers: bool = True,
+    ) -> ToolResult:
+        full_path = self._validate_path(path)
+        if full_path.is_dir():
+            if view_range:
+                raise ToolError("view_range not applicable for directories")
+            # List directory contents using pathlib
+            contents = []
+            try:
+                for item in sorted(full_path.iterdir()):
+                    if item.is_dir():
+                        contents.append(f"  {item.name}/")
+                    else:
+                        contents.append(f"  {item.name}")
+                output = f"Directory contents of {path}:\n" + "\n".join(contents)
+                return ToolResult(output=output)
+            except Exception as e:
+                raise ToolError(f"Failed to list directory: {str(e)}")
+        
+        try:
+            content = full_path.read_text()
+            if view_range:
+                lines = content.splitlines()
+                start, end = view_range
+                if start < 1 or start > len(lines) or end < start or end > len(lines):
+                    raise ToolError(f"Invalid view_range: {view_range}")
+                content = "\n".join(lines[start - 1 : end])
+
+            if line_numbers:
+                start_num = view_range[0] if view_range else 1
+                numbered_content = "\n".join(
+                    f"{str(start_num + i).rjust(6)}\t{line}" for i, line in enumerate(content.splitlines())
+                )
+                return ToolResult(output=numbered_content)
+
+            return ToolResult(output=content)
+        except Exception as e:
+            raise ToolError(f"Failed to view file: {str(e)}")
+
+    async def create(self, path: str, content: str, mode: str = "text", encoding: str = "utf-8") -> ToolResult:
+        """Create a new file with the given content, failing if it already exists."""
+        full_path = self._validate_path(path)
+        if full_path.exists():
+            raise ToolError("File already exists")
+        try:
+            full_path.parent.mkdir(parents=True, exist_ok=True)
+            if mode == "text":
+                full_path.write_text(content, encoding=encoding)
+            elif mode == "binary":
+                full_path.write_bytes(base64.b64decode(content))
+            else:
+                raise ToolError("Invalid mode: choose 'text' or 'binary'")
+            return ToolResult(output=f"File created: {path}")
+        except Exception as e:
+            raise ToolError(f"Failed to create file: {str(e)}")
+
+    async def replace(self, path: str, old_str: str, new_str: str, all_occurrences: bool = False) -> ToolResult:
+        """Replace a string in a file, optionally all occurrences."""
+        full_path = self._validate_path(path)
+        if not full_path.is_file():
+            raise ToolError("Path is not a file")
+        try:
+            content = full_path.read_text()
+
+            # CASE 1 – literal text matches
+            if old_str in content:
+                if all_occurrences:
+                    new_content = content.replace(old_str, new_str)
+                else:
+                    if content.count(old_str) > 1:
+                        raise ToolError("Multiple occurrences found; set all_occurrences=True to replace all")
+                    new_content = content.replace(old_str, new_str, 1)
+            # CASE 2 – literal differs only by line-ending or trailing-space -> replace on normalised text then restore original line endings
+            else:
+                # Compare using normalised versions so CRLF/LF or trailing spaces do not cause false negatives.
+                cmp_content = content.replace("\r\n", "\n")
+                cmp_old = old_str.replace("\r\n", "\n")
+                if cmp_old not in cmp_content:
+                    raise ToolError(f"'{old_str}' not found")
+
+                norm_new = new_str.replace("\r\n", "\n")
+                if all_occurrences:
+                    norm_new_content = cmp_content.replace(cmp_old, norm_new)
+                else:
+                    if cmp_content.count(cmp_old) > 1:
+                        raise ToolError("Multiple occurrences found; set all_occurrences=True to replace all")
+                    norm_new_content = cmp_content.replace(cmp_old, norm_new, 1)
+
+                # Convert the normalised content back to the original EOL style
+                if "\r\n" in content:
+                    new_content = norm_new_content.replace("\n", "\r\n")
+                else:
+                    new_content = norm_new_content
+
+            self._file_history[full_path].append(content)
+            if len(self._file_history[full_path]) > 5:
+                self._file_history[full_path].pop(0)
+            full_path.write_text(new_content)
+            return ToolResult(output=f"Replaced \"{_shorten(old_str)}\" with \"{_shorten(new_str)}\"")
+        except Exception as e:
+            raise ToolError(f"Failed to replace string: {str(e)}")
+
+    async def insert(self, path: str, line: int, text: str) -> ToolResult:
+        """Insert text at a specific line in a file."""
+        full_path = self._validate_path(path)
+        if not full_path.is_file():
+            raise ToolError("Path is not a file")
+        try:
+            content = full_path.read_text()
+            lines = content.splitlines()
+            if line < 1 or line > len(lines) + 1:
+                raise ToolError(f"Line number {line} is out of range")
+            lines.insert(line - 1, text)
+            new_content = "\n".join(lines)
+            self._file_history[full_path].append(content)
+            if len(self._file_history[full_path]) > 5:
+                self._file_history[full_path].pop(0)
+            full_path.write_text(new_content)
+            return ToolResult(output=f"Inserted \"{_shorten(text)}\" at line {line}")
+        except Exception as e:
+            raise ToolError(f"Failed to insert text: {str(e)}")
+
+    async def delete_lines(self, path: str, lines: List[int]) -> ToolResult:
+        """Delete specified lines from a file."""
+        full_path = self._validate_path(path)
+        if not full_path.is_file():
+            raise ToolError("Path is not a file")
+        try:
+            content = full_path.read_text()
+            file_lines = content.splitlines()
+            lines_to_delete = set(lines)
+            new_lines = [line for i, line in enumerate(file_lines, 1) if i not in lines_to_delete]
+            new_content = "\n".join(new_lines)
+            self._file_history[full_path].append(content)
+            if len(self._file_history[full_path]) > 5:
+                self._file_history[full_path].pop(0)
+            full_path.write_text(new_content)
+            return ToolResult(output=f"Deleted lines {lines}")
+        except Exception as e:
+            raise ToolError(f"Failed to delete lines: {str(e)}")
+
+    async def undo(self, path: str) -> ToolResult:
+        """Undo the last text editing operation on a file."""
+        full_path = self._validate_path(path)
+        if not full_path.is_file():
+            raise ToolError("File does not exist")
+        if not self._file_history.get(full_path):
+            raise ToolError("No undo history available")
+        try:
+            previous_content = self._file_history[full_path].pop()
+            full_path.write_text(previous_content)
+            return ToolResult(output=f"Undid last edit on {path}")
+        except Exception as e:
+            raise ToolError(f"Failed to undo edit: {str(e)}")
+
+    async def grep(
+        self,
+        pattern: str,
+        path: str,
+        case_sensitive: bool = True,
+        recursive: bool = False,
+        line_numbers: bool = True
+    ) -> ToolResult:
+        """Search for a pattern in a file or directory."""
+        full_path = self._validate_path(path)
+        flags = 0 if case_sensitive else re.IGNORECASE
+        results = []
+
+        def search_file(file_path):
+            try:
+                # Skip if not a regular file (sockets, pipes, etc.)
+                if not file_path.is_file() or (file_path.is_symlink() and not file_path.resolve().is_file()):
+                    return
+                
+                with file_path.open('r', encoding='utf-8') as f:
+                    for i, line in enumerate(f, 1):
+                        if re.search(pattern, line, flags):
+                            results.append({
+                                'file': str(file_path.relative_to(self.base_path)),
+                                'line_number': i if line_numbers else None,
+                                'content': line.strip()
+                            })
+            except (UnicodeDecodeError, IOError, OSError):
+                # Skip binary files and files that can't be read
+                pass
+
+        if full_path.is_file():
+            search_file(full_path)
+        elif full_path.is_dir():
+            if not recursive:
+                raise ToolError("Recursive search must be enabled for directories")
+            for root, _, files in os.walk(full_path):
+                for file in files:
+                    search_file(Path(root) / file)
+        else:
+            raise ToolError("Path does not exist")
+
+        if not results:
+            return ToolResult(output="No matches found")
+
+        output = "\n".join([
+            f"{r['file']}:{r['line_number']}:{r['content']}" if r['line_number'] else f"{r['file']}:{r['content']}"
+            for r in results
+        ])
+        return ToolResult(output=output)
+
+
 # FastAPI app and endpoints
 app = FastAPI(
-    title="Bash Tool API",
-    description="REST API for bash command execution",
+    title="Bash and File Tool API",
+    description="REST API for bash command execution and file operations",
     version="1.0.0"
 )
 
-# Initialize bash tool
-bash_tool = BashTool()
+# Add CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # Define the workspace directory
 WORKSPACE_DIR = Path("/project/workspace")
 if not WORKSPACE_DIR.exists():
     # Fallback for local development
     WORKSPACE_DIR = Path.cwd()
+
+# Initialize tools
+bash_tool = BashTool()
+file_tool = FileTool(base_path=WORKSPACE_DIR)
 
 # Mount static file server
 app.mount("/static", StaticFiles(directory=str(WORKSPACE_DIR), html=True), name="static")
@@ -568,6 +1008,27 @@ class BashRequest(BaseModel):
     list_sessions: Optional[bool] = False
     check_session: Optional[int] = None
     timeout: Optional[float] = None
+
+
+class FileRequest(BaseModel):
+    command: str
+    path: Optional[str] = None
+    content: Optional[str] = None
+    mode: Optional[str] = "text"
+    encoding: Optional[str] = "utf-8"
+    line_numbers: Optional[bool] = True
+    recursive: Optional[bool] = False
+    src: Optional[str] = None
+    dst: Optional[str] = None
+    view_range: Optional[List[int]] = None
+    old_str: Optional[str] = None
+    new_str: Optional[str] = None
+    all_occurrences: Optional[bool] = False
+    line: Optional[int] = None
+    text: Optional[str] = None
+    lines: Optional[List[int]] = None
+    pattern: Optional[str] = None
+    case_sensitive: Optional[bool] = True
 
 
 class ToolResponse(BaseModel):
@@ -597,9 +1058,23 @@ async def bash_action(request: BashRequest):
         raise HTTPException(status_code=400, detail=str(e))
 
 
+@app.post("/file", response_model=ToolResponse)
+async def file_action(request: FileRequest):
+    """Execute file operations"""
+    try:
+        # Convert request to kwargs, excluding None values
+        kwargs = request.model_dump(exclude_none=True)
+        result = await file_tool(**kwargs)
+        return _tool_result_to_response(result)
+    except ToolError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
+
+
 @app.get("/status")
 async def get_status():
-    return {"status": "ok", "service": "bash-tool-api"}
+    return {"status": "ok", "service": "bash-and-file-tool-api"}
 
 
 @app.get("/list-files")
@@ -650,10 +1125,11 @@ async def get_file(file_path: str):
 @app.get("/")
 async def root():
     return {
-        "service": "Bash Tool API",
+        "service": "Bash and File Tool API",
         "version": "1.0.0",
         "endpoints": [
             {"path": "/bash", "method": "POST", "description": "Execute bash commands"},
+            {"path": "/file", "method": "POST", "description": "File operations (read, write, create, delete, etc.)"},
             {"path": "/status", "method": "GET", "description": "Check service status"},
             {"path": "/list-files", "method": "GET", "description": "List all files in workspace"},
             {"path": "/file/{file_path}", "method": "GET", "description": "Get a specific file"},
