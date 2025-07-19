@@ -1078,22 +1078,42 @@ async def get_status():
 
 
 @app.get("/list-files")
-async def list_files():
-    """List all files in the workspace directory with absolute paths"""
+async def list_files(path: str = None):
+    """List first-level files and directories at the given path"""
     try:
-        files = []
-        for file_path in WORKSPACE_DIR.rglob("*"):
-            if file_path.is_file():
-                # Skip hidden files and directories
-                if not any(part.startswith('.') for part in file_path.parts):
-                    files.append(str(file_path))
+        # Use provided path or default to workspace
+        if path:
+            target_path = Path(path)
+            # Security check: ensure the path exists and is a directory
+            if not target_path.exists():
+                raise HTTPException(status_code=404, detail="Path not found")
+            if not target_path.is_dir():
+                raise HTTPException(status_code=400, detail="Path is not a directory")
+        else:
+            target_path = WORKSPACE_DIR
         
-        files.sort()
+        items = []
+        # List only immediate children (first level)
+        for item_path in target_path.iterdir():
+            # Skip hidden files and directories
+            if not item_path.name.startswith('.'):
+                item_info = {
+                    "name": item_path.name,
+                    "path": str(item_path),
+                    "type": "directory" if item_path.is_dir() else "file"
+                }
+                items.append(item_info)
+        
+        # Sort items by name
+        items.sort(key=lambda x: x["name"])
+        
         return {
-            "total_files": len(files),
-            "workspace": str(WORKSPACE_DIR),
-            "files": files
+            "path": str(target_path),
+            "total_items": len(items),
+            "items": items
         }
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error listing files: {str(e)}")
 
@@ -1131,7 +1151,7 @@ async def root():
             {"path": "/bash", "method": "POST", "description": "Execute bash commands"},
             {"path": "/file", "method": "POST", "description": "File operations (read, write, create, delete, etc.)"},
             {"path": "/status", "method": "GET", "description": "Check service status"},
-            {"path": "/list-files", "method": "GET", "description": "List all files in workspace"},
+            {"path": "/list-files", "method": "GET", "description": "List first-level files/dirs in path (query param: ?path=/absolute/path)"},
             {"path": "/file/{file_path}", "method": "GET", "description": "Get a specific file"},
             {"path": "/static", "description": "Static file server (browse to /static)"},
             {"path": "/docs", "method": "GET", "description": "API documentation"}
