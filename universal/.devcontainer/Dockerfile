@@ -31,10 +31,9 @@ RUN pip install s5cmd --user --no-warn-script-location
 ENV PATH="/root/.local/bin:$PATH"
 
 # Install language servers and FastAPI dependencies
-RUN pip install pyright ruff multilspy fastapi uvicorn[standard]
+RUN pip install pyright ruff multilspy fastapi uvicorn[standard] aiofiles
 RUN npm install -g typescript @typescript-eslint/parser @typescript-eslint/eslint-plugin eslint
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-
 
 # The project will be mounted in /workspace by default
 

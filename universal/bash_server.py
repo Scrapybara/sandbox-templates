@@ -9,6 +9,8 @@ import re
 import base64
 import shutil
 import inspect
+import aiofiles
+import aiofiles.os
 from abc import ABCMeta, abstractmethod
 from collections import defaultdict
 from dataclasses import dataclass, fields, replace
@@ -571,11 +573,15 @@ class FileTool(BaseAnthropicTool):
     def __init__(self, base_path: Path | None = None):
         self._file_history = defaultdict(list)
         self.base_path = base_path or Path.cwd()
-        if not self.base_path.exists():
-            self.base_path.mkdir(parents=True, exist_ok=True)
+        # Note: We'll check/create the base_path in the first async call
         super().__init__()
     
-    def _validate_path(self, path: str) -> Path:
+    async def _ensure_base_path_exists(self):
+        """Ensure base path exists - call this in async methods that need it"""
+        if not await aiofiles.os.path.exists(str(self.base_path)):
+            await asyncio.to_thread(self.base_path.mkdir, parents=True, exist_ok=True)
+    
+    async def _validate_path(self, path: str) -> Path:
         try:
             path_obj = Path(path)
             full_path = path_obj if path_obj.is_absolute() else (self.base_path / path_obj).resolve()
@@ -617,12 +623,13 @@ class FileTool(BaseAnthropicTool):
 
     async def read(self, path: str, mode: str = "text", encoding: str = "utf-8", line_numbers: bool = True) -> ToolResult:
         """Read the content of a file in text or binary mode."""
-        full_path = self._validate_path(path)
-        if not full_path.is_file():
+        full_path = await self._validate_path(path)
+        if not await aiofiles.os.path.isfile(str(full_path)):
             raise ToolError("Path is not a file")
         try:
             if mode == "text":
-                content = full_path.read_text(encoding=encoding)
+                async with aiofiles.open(str(full_path), 'r', encoding=encoding) as f:
+                    content = await f.read()
                 if line_numbers:
                     numbered_content = "\n".join(
                         f"{str(i + 1).rjust(6)}\t{line}" for i, line in enumerate(content.splitlines())
@@ -630,7 +637,9 @@ class FileTool(BaseAnthropicTool):
                     return ToolResult(output=numbered_content)
                 return ToolResult(output=content)
             elif mode == "binary":
-                content = base64.b64encode(full_path.read_bytes()).decode()
+                async with aiofiles.open(str(full_path), 'rb') as f:
+                    binary_content = await f.read()
+                content = base64.b64encode(binary_content).decode()
                 return ToolResult(output=content, system="binary")
             else:
                 raise ToolError("Invalid mode: choose 'text' or 'binary'")
@@ -639,13 +648,17 @@ class FileTool(BaseAnthropicTool):
 
     async def write(self, path: str, content: str, mode: str = "text", encoding: str = "utf-8") -> ToolResult:
         """Write content to a file, overwriting if it exists."""
-        full_path = self._validate_path(path)
+        full_path = await self._validate_path(path)
         try:
-            full_path.parent.mkdir(parents=True, exist_ok=True)
+            await self._ensure_base_path_exists()
+            await asyncio.to_thread(full_path.parent.mkdir, parents=True, exist_ok=True)
             if mode == "text":
-                full_path.write_text(content, encoding=encoding)
+                async with aiofiles.open(str(full_path), 'w', encoding=encoding) as f:
+                    await f.write(content)
             elif mode == "binary":
-                full_path.write_bytes(base64.b64decode(content))
+                decoded_content = base64.b64decode(content)
+                async with aiofiles.open(str(full_path), 'wb') as f:
+                    await f.write(decoded_content)
             else:
                 raise ToolError("Invalid mode: choose 'text' or 'binary'")
             return ToolResult(output=f"File written to {path}")
@@ -654,15 +667,16 @@ class FileTool(BaseAnthropicTool):
 
     async def append(self, path: str, content: str, mode: str = "text", encoding: str = "utf-8") -> ToolResult:
         """Append content to an existing file or create it if it doesn't exist."""
-        full_path = self._validate_path(path)
+        full_path = await self._validate_path(path)
         try:
+            await self._ensure_base_path_exists()
             if mode == "text":
-                with full_path.open('a', encoding=encoding) as f:
-                    f.write(content)
+                async with aiofiles.open(str(full_path), 'a', encoding=encoding) as f:
+                    await f.write(content)
             elif mode == "binary":
                 decoded_content = base64.b64decode(content)
-                with full_path.open('ab') as f:
-                    f.write(decoded_content)
+                async with aiofiles.open(str(full_path), 'ab') as f:
+                    await f.write(decoded_content)
             else:
                 raise ToolError("Invalid mode: choose 'text' or 'binary'")
             return ToolResult(output=f"Appended to file {path}")
@@ -671,15 +685,15 @@ class FileTool(BaseAnthropicTool):
 
     async def delete(self, path: str, recursive: bool = False) -> ToolResult:
         """Delete a file or directory, optionally recursively."""
-        full_path = self._validate_path(path)
+        full_path = await self._validate_path(path)
         try:
-            if full_path.is_file():
-                full_path.unlink()
-            elif full_path.is_dir():
+            if await aiofiles.os.path.isfile(str(full_path)):
+                await aiofiles.os.remove(str(full_path))
+            elif await aiofiles.os.path.isdir(str(full_path)):
                 if recursive:
-                    shutil.rmtree(full_path)
+                    await asyncio.to_thread(shutil.rmtree, str(full_path))
                 else:
-                    full_path.rmdir()
+                    await aiofiles.os.rmdir(str(full_path))
             else:
                 raise ToolError("Path does not exist")
             self._file_history.pop(full_path, None)  # Clear undo history
@@ -690,21 +704,22 @@ class FileTool(BaseAnthropicTool):
     async def exists(self, path: str) -> ToolResult:
         """Check if a path exists."""
         try:
-            full_path = self._validate_path(path)
-            exists = full_path.exists()
+            full_path = await self._validate_path(path)
+            exists = await aiofiles.os.path.exists(str(full_path))
             return ToolResult(output=str(exists))
         except Exception as e:
             return ToolResult(error=f"Failed to check existence: {str(e)}")
 
     async def list_dir(self, path: str) -> ToolResult:
         """List the contents of a directory."""
-        full_path = self._validate_path(path)
-        if not full_path.is_dir():
+        full_path = await self._validate_path(path)
+        if not await aiofiles.os.path.isdir(str(full_path)):
             raise ToolError("Path is not a directory")
         try:
             contents = []
-            for p in sorted(full_path.iterdir()):
-                if p.is_dir():
+            items = await asyncio.to_thread(list, full_path.iterdir())
+            for p in sorted(items):
+                if await aiofiles.os.path.isdir(str(p)):
                     contents.append(f"{p.name}/")
                 else:
                     contents.append(p.name)
@@ -714,29 +729,32 @@ class FileTool(BaseAnthropicTool):
 
     async def mkdir(self, path: str) -> ToolResult:
         """Create a directory, including parent directories if needed."""
-        full_path = self._validate_path(path)
+        full_path = await self._validate_path(path)
         try:
-            full_path.mkdir(parents=True, exist_ok=True)
+            await self._ensure_base_path_exists()
+            await asyncio.to_thread(full_path.mkdir, parents=True, exist_ok=True)
             return ToolResult(output=f"Directory created: {path}")
         except Exception as e:
             raise ToolError(f"Failed to create directory: {str(e)}")
 
     async def rmdir(self, path: str) -> ToolResult:
         """Remove an empty directory."""
-        full_path = self._validate_path(path)
+        full_path = await self._validate_path(path)
         try:
-            full_path.rmdir()
+            await self._ensure_base_path_exists()
+            await aiofiles.os.rmdir(str(full_path))
             return ToolResult(output=f"Directory removed: {path}")
         except Exception as e:
             raise ToolError(f"Failed to remove directory: {str(e)}")
 
     async def move(self, src: str, dst: str) -> ToolResult:
         """Move or rename a file or directory."""
-        src_path = self._validate_path(src)
-        dst_path = self._validate_path(dst)
+        src_path = await self._validate_path(src)
+        dst_path = await self._validate_path(dst)
         try:
-            dst_path.parent.mkdir(parents=True, exist_ok=True)
-            src_path.rename(dst_path)
+            await self._ensure_base_path_exists()
+            await asyncio.to_thread(dst_path.parent.mkdir, parents=True, exist_ok=True)
+            await asyncio.to_thread(src_path.rename, dst_path)
             if src_path in self._file_history:
                 self._file_history[dst_path] = self._file_history.pop(src_path)
             return ToolResult(output=f"Moved {src} to {dst}")
@@ -745,14 +763,15 @@ class FileTool(BaseAnthropicTool):
 
     async def copy(self, src: str, dst: str) -> ToolResult:
         """Copy a file or directory."""
-        src_path = self._validate_path(src)
-        dst_path = self._validate_path(dst)
+        src_path = await self._validate_path(src)
+        dst_path = await self._validate_path(dst)
         try:
-            dst_path.parent.mkdir(parents=True, exist_ok=True)
-            if src_path.is_file():
-                shutil.copy2(src_path, dst_path)
-            elif src_path.is_dir():
-                shutil.copytree(src_path, dst_path)
+            await self._ensure_base_path_exists()
+            await asyncio.to_thread(dst_path.parent.mkdir, parents=True, exist_ok=True)
+            if await aiofiles.os.path.isfile(str(src_path)):
+                await asyncio.to_thread(shutil.copy2, str(src_path), str(dst_path))
+            elif await aiofiles.os.path.isdir(str(src_path)):
+                await asyncio.to_thread(shutil.copytree, str(src_path), str(dst_path))
             else:
                 raise ToolError("Source path does not exist")
             return ToolResult(output=f"Copied {src} to {dst}")
@@ -765,15 +784,16 @@ class FileTool(BaseAnthropicTool):
         view_range: Optional[List[int]] = None,
         line_numbers: bool = True,
     ) -> ToolResult:
-        full_path = self._validate_path(path)
-        if full_path.is_dir():
+        full_path = await self._validate_path(path)
+        if await aiofiles.os.path.isdir(str(full_path)):
             if view_range:
                 raise ToolError("view_range not applicable for directories")
             # List directory contents using pathlib
             contents = []
             try:
-                for item in sorted(full_path.iterdir()):
-                    if item.is_dir():
+                items = await asyncio.to_thread(list, full_path.iterdir())
+                for item in sorted(items):
+                    if await aiofiles.os.path.isdir(str(item)):
                         contents.append(f"  {item.name}/")
                     else:
                         contents.append(f"  {item.name}")
@@ -783,7 +803,8 @@ class FileTool(BaseAnthropicTool):
                 raise ToolError(f"Failed to list directory: {str(e)}")
         
         try:
-            content = full_path.read_text()
+            async with aiofiles.open(str(full_path), 'r') as f:
+                content = await f.read()
             if view_range:
                 lines = content.splitlines()
                 start, end = view_range
@@ -804,15 +825,19 @@ class FileTool(BaseAnthropicTool):
 
     async def create(self, path: str, content: str, mode: str = "text", encoding: str = "utf-8") -> ToolResult:
         """Create a new file with the given content, failing if it already exists."""
-        full_path = self._validate_path(path)
-        if full_path.exists():
+        full_path = await self._validate_path(path)
+        if await aiofiles.os.path.exists(str(full_path)):
             raise ToolError("File already exists")
         try:
-            full_path.parent.mkdir(parents=True, exist_ok=True)
+            await self._ensure_base_path_exists()
+            await asyncio.to_thread(full_path.parent.mkdir, parents=True, exist_ok=True)
             if mode == "text":
-                full_path.write_text(content, encoding=encoding)
+                async with aiofiles.open(str(full_path), 'w', encoding=encoding) as f:
+                    await f.write(content)
             elif mode == "binary":
-                full_path.write_bytes(base64.b64decode(content))
+                decoded_content = base64.b64decode(content)
+                async with aiofiles.open(str(full_path), 'wb') as f:
+                    await f.write(decoded_content)
             else:
                 raise ToolError("Invalid mode: choose 'text' or 'binary'")
             return ToolResult(output=f"File created: {path}")
@@ -821,11 +846,12 @@ class FileTool(BaseAnthropicTool):
 
     async def replace(self, path: str, old_str: str, new_str: str, all_occurrences: bool = False) -> ToolResult:
         """Replace a string in a file, optionally all occurrences."""
-        full_path = self._validate_path(path)
-        if not full_path.is_file():
+        full_path = await self._validate_path(path)
+        if not await aiofiles.os.path.isfile(str(full_path)):
             raise ToolError("Path is not a file")
         try:
-            content = full_path.read_text()
+            async with aiofiles.open(str(full_path), 'r') as f:
+                content = await f.read()
 
             # CASE 1 – literal text matches
             if old_str in content:
@@ -860,18 +886,20 @@ class FileTool(BaseAnthropicTool):
             self._file_history[full_path].append(content)
             if len(self._file_history[full_path]) > 5:
                 self._file_history[full_path].pop(0)
-            full_path.write_text(new_content)
+            async with aiofiles.open(str(full_path), 'w') as f:
+                await f.write(new_content)
             return ToolResult(output=f"Replaced \"{_shorten(old_str)}\" with \"{_shorten(new_str)}\"")
         except Exception as e:
             raise ToolError(f"Failed to replace string: {str(e)}")
 
     async def insert(self, path: str, line: int, text: str) -> ToolResult:
         """Insert text at a specific line in a file."""
-        full_path = self._validate_path(path)
-        if not full_path.is_file():
+        full_path = await self._validate_path(path)
+        if not await aiofiles.os.path.isfile(str(full_path)):
             raise ToolError("Path is not a file")
         try:
-            content = full_path.read_text()
+            async with aiofiles.open(str(full_path), 'r') as f:
+                content = await f.read()
             lines = content.splitlines()
             if line < 1 or line > len(lines) + 1:
                 raise ToolError(f"Line number {line} is out of range")
@@ -880,18 +908,20 @@ class FileTool(BaseAnthropicTool):
             self._file_history[full_path].append(content)
             if len(self._file_history[full_path]) > 5:
                 self._file_history[full_path].pop(0)
-            full_path.write_text(new_content)
+            async with aiofiles.open(str(full_path), 'w') as f:
+                await f.write(new_content)
             return ToolResult(output=f"Inserted \"{_shorten(text)}\" at line {line}")
         except Exception as e:
             raise ToolError(f"Failed to insert text: {str(e)}")
 
     async def delete_lines(self, path: str, lines: List[int]) -> ToolResult:
         """Delete specified lines from a file."""
-        full_path = self._validate_path(path)
-        if not full_path.is_file():
+        full_path = await self._validate_path(path)
+        if not await aiofiles.os.path.isfile(str(full_path)):
             raise ToolError("Path is not a file")
         try:
-            content = full_path.read_text()
+            async with aiofiles.open(str(full_path), 'r') as f:
+                content = await f.read()
             file_lines = content.splitlines()
             lines_to_delete = set(lines)
             new_lines = [line for i, line in enumerate(file_lines, 1) if i not in lines_to_delete]
@@ -899,21 +929,23 @@ class FileTool(BaseAnthropicTool):
             self._file_history[full_path].append(content)
             if len(self._file_history[full_path]) > 5:
                 self._file_history[full_path].pop(0)
-            full_path.write_text(new_content)
+            async with aiofiles.open(str(full_path), 'w') as f:
+                await f.write(new_content)
             return ToolResult(output=f"Deleted lines {lines}")
         except Exception as e:
             raise ToolError(f"Failed to delete lines: {str(e)}")
 
     async def undo(self, path: str) -> ToolResult:
         """Undo the last text editing operation on a file."""
-        full_path = self._validate_path(path)
-        if not full_path.is_file():
+        full_path = await self._validate_path(path)
+        if not await aiofiles.os.path.isfile(str(full_path)):
             raise ToolError("File does not exist")
         if not self._file_history.get(full_path):
             raise ToolError("No undo history available")
         try:
             previous_content = self._file_history[full_path].pop()
-            full_path.write_text(previous_content)
+            async with aiofiles.open(str(full_path), 'w') as f:
+                await f.write(previous_content)
             return ToolResult(output=f"Undid last edit on {path}")
         except Exception as e:
             raise ToolError(f"Failed to undo edit: {str(e)}")
@@ -927,18 +959,27 @@ class FileTool(BaseAnthropicTool):
         line_numbers: bool = True
     ) -> ToolResult:
         """Search for a pattern in a file or directory."""
-        full_path = self._validate_path(path)
+        full_path = await self._validate_path(path)
         flags = 0 if case_sensitive else re.IGNORECASE
         results = []
 
-        def search_file(file_path):
+        async def search_file(file_path):
             try:
                 # Skip if not a regular file (sockets, pipes, etc.)
-                if not file_path.is_file() or (file_path.is_symlink() and not file_path.resolve().is_file()):
+                is_file = await aiofiles.os.path.isfile(str(file_path))
+                is_symlink = await asyncio.to_thread(file_path.is_symlink)
+                if is_symlink:
+                    resolved = await asyncio.to_thread(file_path.resolve)
+                    is_resolved_file = await aiofiles.os.path.isfile(str(resolved))
+                    if not is_resolved_file:
+                        return
+                elif not is_file:
                     return
                 
-                with file_path.open('r', encoding='utf-8') as f:
-                    for i, line in enumerate(f, 1):
+                async with aiofiles.open(str(file_path), 'r', encoding='utf-8') as f:
+                    i = 0
+                    async for line in f:
+                        i += 1
                         if re.search(pattern, line, flags):
                             results.append({
                                 'file': str(file_path.relative_to(self.base_path)),
@@ -949,14 +990,15 @@ class FileTool(BaseAnthropicTool):
                 # Skip binary files and files that can't be read
                 pass
 
-        if full_path.is_file():
-            search_file(full_path)
-        elif full_path.is_dir():
+        if await aiofiles.os.path.isfile(str(full_path)):
+            await search_file(full_path)
+        elif await aiofiles.os.path.isdir(str(full_path)):
             if not recursive:
                 raise ToolError("Recursive search must be enabled for directories")
-            for root, _, files in os.walk(full_path):
+            # Use asyncio.to_thread for os.walk since there's no native async version
+            for root, _, files in await asyncio.to_thread(os.walk, str(full_path)):
                 for file in files:
-                    search_file(Path(root) / file)
+                    await search_file(Path(root) / file)
         else:
             raise ToolError("Path does not exist")
 
@@ -1078,42 +1120,38 @@ async def get_status():
 
 
 @app.get("/list-files")
-async def list_files(path: str = None):
-    """List first-level files and directories at the given path"""
+async def list_files():
+    """List all files and directories recursively in the workspace"""
     try:
-        # Use provided path or default to workspace
-        if path:
-            target_path = Path(path)
-            # Security check: ensure the path exists and is a directory
-            if not target_path.exists():
-                raise HTTPException(status_code=404, detail="Path not found")
-            if not target_path.is_dir():
-                raise HTTPException(status_code=400, detail="Path is not a directory")
-        else:
-            target_path = WORKSPACE_DIR
-        
         items = []
-        # List only immediate children (first level)
-        for item_path in target_path.iterdir():
-            # Skip hidden files and directories
-            if not item_path.name.startswith('.'):
-                item_info = {
-                    "name": item_path.name,
-                    "path": str(item_path),
-                    "type": "directory" if item_path.is_dir() else "file"
-                }
-                items.append(item_info)
         
-        # Sort items by name
-        items.sort(key=lambda x: x["name"])
+        # Get all files recursively using rglob in a thread
+        all_paths = await asyncio.to_thread(list, WORKSPACE_DIR.rglob('*'))
+        
+        for item_path in all_paths:
+            # Skip hidden files and directories (and their contents)
+            if any(part.startswith('.') for part in item_path.parts):
+                continue
+            
+            is_dir = await aiofiles.os.path.isdir(str(item_path))
+            relative_path = item_path.relative_to(WORKSPACE_DIR)
+            
+            item_info = {
+                "name": item_path.name,
+                "path": str(item_path),
+                "relative_path": str(relative_path),
+                "type": "directory" if is_dir else "file"
+            }
+            items.append(item_info)
+        
+        # Sort items by relative path
+        items.sort(key=lambda x: x["relative_path"])
         
         return {
-            "path": str(target_path),
+            "workspace_path": str(WORKSPACE_DIR),
             "total_items": len(items),
             "items": items
         }
-    except HTTPException:
-        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error listing files: {str(e)}")
 
@@ -1125,14 +1163,15 @@ async def get_file(file_path: str):
         full_path = WORKSPACE_DIR / file_path
         
         # Security check: ensure the path is within workspace
-        full_path = full_path.resolve()
-        if not str(full_path).startswith(str(WORKSPACE_DIR.resolve())):
+        full_path = await asyncio.to_thread(full_path.resolve)
+        workspace_resolved = await asyncio.to_thread(WORKSPACE_DIR.resolve)
+        if not str(full_path).startswith(str(workspace_resolved)):
             raise HTTPException(status_code=403, detail="Access denied: Path outside workspace")
         
-        if not full_path.exists():
+        if not await aiofiles.os.path.exists(str(full_path)):
             raise HTTPException(status_code=404, detail="File not found")
         
-        if not full_path.is_file():
+        if not await aiofiles.os.path.isfile(str(full_path)):
             raise HTTPException(status_code=400, detail="Path is not a file")
         
         return FileResponse(path=str(full_path), filename=full_path.name)
@@ -1151,7 +1190,7 @@ async def root():
             {"path": "/bash", "method": "POST", "description": "Execute bash commands"},
             {"path": "/file", "method": "POST", "description": "File operations (read, write, create, delete, etc.)"},
             {"path": "/status", "method": "GET", "description": "Check service status"},
-            {"path": "/list-files", "method": "GET", "description": "List first-level files/dirs in path (query param: ?path=/absolute/path)"},
+            {"path": "/list-files", "method": "GET", "description": "List all files and directories recursively in /project/workspace"},
             {"path": "/file/{file_path}", "method": "GET", "description": "Get a specific file"},
             {"path": "/static", "description": "Static file server (browse to /static)"},
             {"path": "/docs", "method": "GET", "description": "API documentation"}
