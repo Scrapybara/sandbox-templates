@@ -146,7 +146,7 @@ class _BashSession:
             
         try:
             if self._process.stdout._buffer:
-                output = self._process.stdout._buffer.decode()
+                output = self._process.stdout._buffer.decode(errors="replace")
                 self._partial_output = output
                 
                 if self._sentinel in output:
@@ -264,11 +264,11 @@ class _BashSession:
         
         output = self._partial_output
         if self._process.stdout._buffer:
-            output += self._process.stdout._buffer.decode()
+            output += self._process.stdout._buffer.decode(errors="replace")
             
         error = self._partial_error
         if self._process.stderr._buffer:
-            error += self._process.stderr._buffer.decode()
+            error += self._process.stderr._buffer.decode(errors="replace")
             
         filtered_error = self._filter_error_output(error)
             
@@ -346,9 +346,9 @@ echo '{self._sentinel}'
                 self._process.stdout.readuntil(self._sentinel.encode()),
                 timeout=command_timeout
             )
-            output = data.decode().replace(self._sentinel, "")
+            output = data.decode(errors="replace").replace(self._sentinel, "")
             self._partial_output = output
-            error = self._process.stderr._buffer.decode()
+            error = self._process.stderr._buffer.decode(errors="replace")
             self._partial_error = error
             self._is_running_command = False
         except asyncio.TimeoutError:
@@ -372,19 +372,19 @@ echo '{self._sentinel}'
                     )
                     if not chunk:
                         break
-                    output_chunks.append(chunk.decode())
+                    output_chunks.append(chunk.decode(errors="replace"))
                     accumulated = ''.join(output_chunks)
                     if self._sentinel in accumulated:
                         output = accumulated.replace(self._sentinel, "")
                         self._partial_output = output
-                        error = self._process.stderr._buffer.decode()
+                        error = self._process.stderr._buffer.decode(errors="replace")
                         self._partial_error = error
                         self._is_running_command = False
                         break
             except asyncio.TimeoutError:
                 output = ''.join(output_chunks)
                 self._partial_output = output
-                error = self._process.stderr._buffer.decode()
+                error = self._process.stderr._buffer.decode(errors="replace")
                 self._partial_error = error
         except Exception as e:
             self._is_running_command = False
@@ -808,6 +808,11 @@ class FileTool(BaseAnthropicTool):
             if view_range:
                 lines = content.splitlines()
                 start, end = view_range
+                # Allow negative offsets: -1 refers to the last line, -2 the line before, etc.
+                if start < 0:
+                    start = len(lines) + start + 1  # convert to 1-indexed positive
+                if end < 0:
+                    end = len(lines) + end + 1
                 if start < 1 or start > len(lines) or end < start or end > len(lines):
                     raise ToolError(f"Invalid view_range: {view_range}")
                 content = "\n".join(lines[start - 1 : end])
