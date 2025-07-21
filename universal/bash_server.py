@@ -31,6 +31,60 @@ Command = Literal[
     "view", "create", "replace", "insert", "delete_lines", "undo", "grep"
 ]
 
+# Files and directories to exclude from serving/listing
+EXCLUDED_PATTERNS = [
+    "bash_server.py",
+    "lsp.py",
+    ".codesandbox",
+    ".devcontainer",
+    "__pycache__",
+    "README",
+    "README.md",
+    "README.txt",
+    "README.rst"
+]
+
+
+def _is_excluded_path(path: Path) -> bool:
+    """Check if a path should be excluded from serving/listing."""
+    # Get the workspace directory for comparison
+    workspace_dir = WORKSPACE_DIR
+    
+    try:
+        # Resolve the path to handle any symlinks or relative paths
+        resolved_path = path.resolve()
+        workspace_resolved = workspace_dir.resolve()
+        
+        # Check if this is a root-level file/directory
+        # Get the relative path from workspace root
+        try:
+            relative_path = resolved_path.relative_to(workspace_resolved)
+        except ValueError:
+            # Path is not within workspace
+            return False
+            
+        # Get the first part of the path (root-level item)
+        parts = relative_path.parts
+        if not parts:
+            return False
+            
+        root_item = parts[0]
+        
+        # Check if the root item matches any excluded pattern
+        for pattern in EXCLUDED_PATTERNS:
+            if root_item == pattern:
+                return True
+                
+        # Also check for hidden files/directories at root level only
+        if root_item.startswith('.'):
+            return True
+            
+    except Exception:
+        # If there's any error in path resolution, don't exclude
+        return False
+        
+    return False
+
 
 def _shorten(text: str, limit: int = 120) -> str:
     """Return *text* truncated to *limit* chars, escaping newlines for readability."""
@@ -1108,8 +1162,8 @@ async def list_files():
         all_paths = await asyncio.to_thread(list, WORKSPACE_DIR.rglob('*'))
         
         for item_path in all_paths:
-            # Skip hidden files and directories (and their contents)
-            if any(part.startswith('.') for part in item_path.parts):
+            # Check if path should be excluded
+            if _is_excluded_path(item_path):
                 continue
             
             is_dir = await aiofiles.os.path.isdir(str(item_path))
@@ -1146,6 +1200,10 @@ async def get_file(file_path: str):
         workspace_resolved = await asyncio.to_thread(WORKSPACE_DIR.resolve)
         if not str(full_path).startswith(str(workspace_resolved)):
             raise HTTPException(status_code=403, detail="Access denied: Path outside workspace")
+        
+        # Check if file is excluded
+        if _is_excluded_path(full_path):
+            raise HTTPException(status_code=403, detail="Access denied: File is excluded from serving")
         
         if not await aiofiles.os.path.exists(str(full_path)):
             raise HTTPException(status_code=404, detail="File not found")
