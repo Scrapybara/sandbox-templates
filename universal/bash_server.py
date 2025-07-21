@@ -14,7 +14,7 @@ import aiofiles.os
 from abc import ABCMeta, abstractmethod
 from collections import defaultdict
 from dataclasses import dataclass, fields, replace
-from typing import Any, ClassVar, Dict, List, Literal, Optional, Tuple, get_args
+from typing import Any, ClassVar, Dict, List, Literal, Optional, get_args
 
 from fastapi import FastAPI, HTTPException
 from fastapi.staticfiles import StaticFiles
@@ -97,7 +97,6 @@ class _BashSession:
 
     _started: bool
     _process: asyncio.subprocess.Process
-    _current_directory: str
     _is_running_command: bool
     _last_command: str
     _partial_output: str
@@ -111,7 +110,6 @@ class _BashSession:
 
     def __init__(self, session_id: int):
         self._started = False
-        self._current_directory = ""
         self._is_running_command = False
         self._last_command = ""
         self._partial_output = ""
@@ -133,7 +131,7 @@ class _BashSession:
         
     @property
     def current_directory(self) -> str:
-        return self._current_directory
+        return str(WORKSPACE_DIR)
         
     async def check_command_completion(self) -> bool:
         """Check if a running command has completed."""
@@ -157,26 +155,6 @@ class _BashSession:
             
         return False
 
-    def _process_output(self, output: str, prev_dir: str) -> Tuple[str, List[str]]:
-        """Process command output to handle directory changes."""
-        system_messages: List[str] = []
-
-        # Handle working directory changes
-        lines = output.split('\n')
-        cwd_change_line = next((l for l in lines if l.startswith('CWD_CHANGE:')), None)
-        if cwd_change_line:
-            new_dir = cwd_change_line.split(':', 1)[1].strip()
-            self._current_directory = new_dir
-            system_messages.append(f'Current directory: {new_dir}')
-
-        # Remove any CWD_CHANGE marker lines from the output
-        output = '\n'.join(
-            l for l in lines
-            if not l.startswith('CWD_CHANGE:')
-        ).rstrip('\n')
-
-        return output, system_messages
-        
     def _filter_error_output(self, error: str) -> str:
         """Filter out common error messages that don't affect command execution."""
         if not error:
@@ -218,7 +196,6 @@ class _BashSession:
             )
 
             self._started = True
-            self._current_directory = os.getcwd()
                 
         except Exception as e:
             raise ToolError(f"Failed to start bash session: {str(e)}")
@@ -276,10 +253,8 @@ class _BashSession:
             self._is_running_command = False
             output = output.replace(self._sentinel, "")
             
-            prev_dir = self._current_directory
-            processed_output, system_messages = self._process_output(output, prev_dir)
-            
-            system_msg = f"Command completed. {', '.join(system_messages) if system_messages else ''} Session ID: {self._session_id}".strip()
+            processed_output = output.rstrip('\n')
+            system_msg = f"Command completed. Session ID: {self._session_id}"
             return CLIResult(
                 output=processed_output,
                 error=filtered_error,
@@ -319,12 +294,12 @@ class _BashSession:
         self._last_command = command
         self._is_running_command = True
         
-        prev_dir = self._current_directory
+        base_dir = str(WORKSPACE_DIR)
 
         wrapped_command = f"""
 {command}
 
-echo "CWD_CHANGE: $(pwd)"
+cd "{base_dir}"
 echo '{self._sentinel}'
 """
         self._process.stdout._buffer.clear()
@@ -393,14 +368,13 @@ echo '{self._sentinel}'
                 system="An unexpected error occurred"
             )
 
-        processed_output, system_messages = self._process_output(output, prev_dir)
+        processed_output = output.rstrip('\n')
         filtered_error = self._filter_error_output(error)
 
         self._process.stdout._buffer.clear()
         self._process.stderr._buffer.clear()
 
-        system = ", ".join(system_messages) if system_messages else None
-        return CLIResult(output=processed_output, error=filtered_error, system=system)
+        return CLIResult(output=processed_output, error=filtered_error)
 
 
 # Bash Tool implementation
