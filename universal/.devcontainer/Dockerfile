@@ -4,7 +4,7 @@ FROM ghcr.io/codesandbox/devcontainers/universal:latest
 
 # Example: install htop by default
 # RUN apt update -y && apt install -y htop
-RUN apt update && apt install -y ripgrep \
+RUN apt update && apt install -y curl libreoffice ripgrep \
 gpg && \
 mkdir -p /etc/apt/keyrings && \
 wget -qO- https://raw.githubusercontent.com/eza-community/eza/main/deb.asc | gpg --dearmor -o /etc/apt/keyrings/gierens.gpg && \
