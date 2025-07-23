@@ -26,7 +26,7 @@
     },
     "init-git": {
       "name": "initialize .gitscout git repo",
-      "command": "cd /project/workspace && git init --bare .gitscout",
+      "command": "cd /project/workspace && git init --bare .gitscout && git --git-dir=/project/workspace/.gitscout --work-tree=. config user.email 'scout@scout.new' && git --git-dir=/project/workspace/.gitscout --work-tree=. config user.name 'Scout'",
       "runAtStart": true,
       "restartOn": {
         "clone": false,
