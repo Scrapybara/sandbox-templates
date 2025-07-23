@@ -20,8 +20,17 @@
         "port": 8000
       },
       "restartOn": {
-        "clone": true,
-        "resume": true
+        "clone": false,
+        "resume": false
+      }
+    },
+    "init-git": {
+      "name": "initialize .gitscout git repo",
+      "command": "cd /project/workspace && git init .gitscout",
+      "runAtStart": true,
+      "restartOn": {
+        "clone": false,
+        "resume": false
       }
     }
   }
