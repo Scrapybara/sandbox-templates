@@ -26,7 +26,7 @@
     },
     "init-git": {
       "name": "initialize .gitscout git repo",
-      "command": "cd /project/workspace && git init .gitscout",
+      "command": "cd /project/workspace && git init --bare .gitscout",
       "runAtStart": true,
       "restartOn": {
         "clone": false,
