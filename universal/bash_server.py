@@ -1157,18 +1157,20 @@ async def list_files(git_ignore: bool = False):
     try:
         items: List[Dict[str, Any]] = []
         try:
-            cmd = [
-                "eza",
-                "-R",
-                "--only-files",
-                "--absolute",
+            # Fast path: ripgrep respects nested .gitignore files
+            rg_cmd = [
+                "rg",
+                "--files",
+                "--hidden",
+                "--color",
+                "never",
             ]
-            if git_ignore:
-                cmd += ["--git-ignore", "--no-ignore-parent"]
-            cmd.append(str(WORKSPACE_DIR))
+            if not git_ignore:
+                rg_cmd.append("--no-ignore")
 
             proc = await asyncio.create_subprocess_exec(
-                *cmd,
+                *rg_cmd,
+                cwd=str(WORKSPACE_DIR),
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
@@ -1176,16 +1178,12 @@ async def list_files(git_ignore: bool = False):
 
             if proc.returncode != 0:
                 raise RuntimeError(
-                    f"eza failed with code {proc.returncode}: {stderr.decode().strip()}"
+                    f"ripgrep failed with code {proc.returncode}: {stderr.decode().strip()}"
                 )
 
-            all_paths = [
-                Path(clean)
-                for raw in stdout.decode().splitlines()
-                if (clean := raw.strip()) and not clean.endswith(":")
-            ]
+            all_paths = [WORKSPACE_DIR / Path(p.strip()) for p in stdout.decode().splitlines() if p.strip()]
         except Exception:
-            # Fallback to Python walk if eza is unavailable or errors
+            # Fallback to Python walk if ripgrep is unavailable or errors
             all_paths = await asyncio.to_thread(list, WORKSPACE_DIR.rglob('*'))
          
         for item_path in all_paths:
