@@ -1153,14 +1153,41 @@ async def get_status():
 
 
 @app.get("/list-files")
-async def list_files():
-    """List all files and directories recursively in the workspace"""
+async def list_files(git_ignore: bool = False):
     try:
-        items = []
-        
-        # Get all files recursively using rglob in a thread
-        all_paths = await asyncio.to_thread(list, WORKSPACE_DIR.rglob('*'))
-        
+        items: List[Dict[str, Any]] = []
+        try:
+            cmd = [
+                "eza",
+                "-R",
+                "--only-files",
+                "--absolute",
+            ]
+            if git_ignore:
+                cmd += ["--git-ignore", "--no-ignore-parent"]
+            cmd.append(str(WORKSPACE_DIR))
+
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await proc.communicate()
+
+            if proc.returncode != 0:
+                raise RuntimeError(
+                    f"eza failed with code {proc.returncode}: {stderr.decode().strip()}"
+                )
+
+            all_paths = [
+                Path(clean)
+                for raw in stdout.decode().splitlines()
+                if (clean := raw.strip()) and not clean.endswith(":")
+            ]
+        except Exception:
+            # Fallback to Python walk if eza is unavailable or errors
+            all_paths = await asyncio.to_thread(list, WORKSPACE_DIR.rglob('*'))
+         
         for item_path in all_paths:
             # Check if path should be excluded
             if _is_excluded_path(item_path):
@@ -1176,10 +1203,10 @@ async def list_files():
                 "type": "directory" if is_dir else "file"
             }
             items.append(item_info)
-        
+         
         # Sort items by relative path
         items.sort(key=lambda x: x["relative_path"])
-        
+         
         return {
             "workspace_path": str(WORKSPACE_DIR),
             "total_items": len(items),
