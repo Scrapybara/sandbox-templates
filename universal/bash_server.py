@@ -16,7 +16,7 @@ from collections import defaultdict
 from dataclasses import dataclass, fields, replace
 from typing import Any, ClassVar, Dict, List, Literal, Optional, get_args
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -429,6 +429,88 @@ echo '{self._sentinel}'
         self._process.stderr._buffer.clear()
 
         return CLIResult(output=processed_output, error=filtered_error)
+
+    async def stream_command(self, command: str):
+        """Run command and yield stdout and stderr lines as they arrive until the sentinel appears."""
+        if not self._started:
+            await self.start()
+
+        await self.check_command_completion()
+        if self._is_running_command:
+            raise ToolError("Session busy running another command")
+
+        assert (
+            self._process
+            and self._process.stdin
+            and self._process.stdout
+            and self._process.stderr
+        )
+
+        self._partial_output = ""
+        self._partial_error = ""
+        self._last_command = command
+        self._is_running_command = True
+
+        wrapped_command = f"""
+{command}
+
+cd \"{WORKSPACE_DIR}\"
+echo '{self._sentinel}'
+"""
+
+        self._process.stdout._buffer.clear()
+        self._process.stderr._buffer.clear()
+
+        self._process.stdin.write(wrapped_command.encode())
+        await self._process.stdin.drain()
+
+        sentinel = self._sentinel
+
+        queue: asyncio.Queue[str] = asyncio.Queue()
+
+        async def _reader(stream: asyncio.StreamReader, is_stdout: bool):
+            """Continuously read chunks (not lines) from *stream* and enqueue them."""
+            buffer = ""
+            chunk_size = 256  # bytes
+
+            while True:
+                data = await stream.read(chunk_size)
+                if not data:
+                    break  # EOF
+
+                text = data.decode(errors="replace")
+
+                if is_stdout:
+                    buffer += text
+
+                    if sentinel in buffer:
+                        before, _sent, _after = buffer.partition(sentinel)
+                        if before:
+                            await queue.put(before)
+                        await queue.put(None)
+                        break
+
+                    if buffer:
+                        await queue.put(buffer)
+                        buffer = ""
+                else:
+                    filtered = self._filter_error_output(text)
+                    if filtered:
+                        await queue.put(filtered)
+
+        stdout_task = asyncio.create_task(_reader(self._process.stdout, True))
+        stderr_task = asyncio.create_task(_reader(self._process.stderr, False))
+
+        try:
+            while True:
+                line = await queue.get()
+                if line is None:  # Sentinel from stdout reader
+                    break
+                yield line
+        finally:
+            for t in (stdout_task, stderr_task):
+                t.cancel()
+            self._is_running_command = False
 
 
 # Bash Tool implementation
@@ -1145,6 +1227,42 @@ async def file_action(request: FileRequest):
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
+
+
+@app.websocket("/bash/ws")
+async def bash_websocket(websocket: WebSocket):
+    """WebSocket endpoint providing live bash output suitable for xterm.js clients."""
+    await websocket.accept()
+
+    # Create a dedicated bash session for this WebSocket connection
+    async with bash_tool._sessions_lock:
+        session_id = max(bash_tool._sessions.keys(), default=0) + 1
+        session = _BashSession(session_id=session_id)
+        await session.start()
+        bash_tool._sessions[session_id] = session
+
+    try:
+        while True:
+            try:
+                command = await websocket.receive_text()
+            except WebSocketDisconnect:
+                break
+            command = command.strip()
+            if not command:
+                continue  # Ignore empty commands
+
+            try:
+                async for chunk in session.stream_command(command):
+                    await websocket.send_text(chunk)
+            except ToolError as e:
+                await websocket.send_text(f"ERROR: {e.message}\n")
+            except Exception as e:
+                await websocket.send_text(f"Unexpected error: {str(e)}\n")
+    finally:
+        # Clean up the session when the WebSocket disconnects
+        session.stop()
+        async with bash_tool._sessions_lock:
+            bash_tool._sessions.pop(session_id, None)
 
 
 @app.get("/status")
