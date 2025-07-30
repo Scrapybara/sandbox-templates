@@ -22,6 +22,12 @@ from fastapi.responses import FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import uvicorn
+import logging
+import time
+
+# Configure logging for performance monitoring
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 from pathlib import Path
 
 
@@ -678,6 +684,8 @@ class FileTool(BaseAnthropicTool):
     """
 
     name: ClassVar[Literal["file"]] = "file"
+    # Maximum file size (in bytes) to store in history to prevent memory issues
+    MAX_HISTORY_FILE_SIZE = 1024 * 1024  # 1MB
     _file_history: Dict[Path, List[str]]  # Undo history for text edits
 
     def __init__(self, base_path: Path | None = None):
@@ -691,6 +699,19 @@ class FileTool(BaseAnthropicTool):
         if not await aiofiles.os.path.exists(str(self.base_path)):
             await asyncio.to_thread(self.base_path.mkdir, parents=True, exist_ok=True)
     
+    
+    def _add_to_history(self, full_path: Path, content: str) -> None:
+        """Add content to file history with size limits to prevent memory issues"""
+        # Skip history for very large files to prevent memory problems
+        if len(content.encode("utf-8")) > self.MAX_HISTORY_FILE_SIZE:
+            # Keep only the most recent version for large files
+            self._file_history[full_path] = []
+            return
+        
+        self._file_history[full_path].append(content)
+        if len(self._file_history[full_path]) > 5:
+            self._file_history[full_path].pop(0)
+
     async def _validate_path(self, path: str) -> Path:
         try:
             path_obj = Path(path)
@@ -998,9 +1019,7 @@ class FileTool(BaseAnthropicTool):
                 else:
                     new_content = norm_new_content
 
-            self._file_history[full_path].append(content)
-            if len(self._file_history[full_path]) > 5:
-                self._file_history[full_path].pop(0)
+            self._add_to_history(full_path, content)
             async with aiofiles.open(str(full_path), 'w') as f:
                 await f.write(new_content)
             return ToolResult(output=f"Replaced \"{_shorten(old_str)}\" with \"{_shorten(new_str)}\"")
@@ -1020,9 +1039,7 @@ class FileTool(BaseAnthropicTool):
                 raise ToolError(f"Line number {line} is out of range")
             lines.insert(line - 1, text)
             new_content = "\n".join(lines)
-            self._file_history[full_path].append(content)
-            if len(self._file_history[full_path]) > 5:
-                self._file_history[full_path].pop(0)
+            self._add_to_history(full_path, content)
             async with aiofiles.open(str(full_path), 'w') as f:
                 await f.write(new_content)
             return ToolResult(output=f"Inserted \"{_shorten(text)}\" at line {line}")
@@ -1041,9 +1058,7 @@ class FileTool(BaseAnthropicTool):
             lines_to_delete = set(lines)
             new_lines = [line for i, line in enumerate(file_lines, 1) if i not in lines_to_delete]
             new_content = "\n".join(new_lines)
-            self._file_history[full_path].append(content)
-            if len(self._file_history[full_path]) > 5:
-                self._file_history[full_path].pop(0)
+            self._add_to_history(full_path, content)
             async with aiofiles.open(str(full_path), 'w') as f:
                 await f.write(new_content)
             return ToolResult(output=f"Deleted lines {lines}")
@@ -1218,14 +1233,22 @@ async def bash_action(request: BashRequest):
 @app.post("/file", response_model=ToolResponse)
 async def file_action(request: FileRequest):
     """Execute file operations"""
+    start_time = time.time()
     try:
         # Convert request to kwargs, excluding None values
         kwargs = request.model_dump(exclude_none=True)
+        logger.info(f"Processing file command: {request.command} for path: {getattr(request, 'path', 'unknown')}")
         result = await file_tool(**kwargs)
+        elapsed = time.time() - start_time
+        logger.info(f"File operation completed in {elapsed:.2f}s")
         return _tool_result_to_response(result)
     except ToolError as e:
+        elapsed = time.time() - start_time
+        logger.error(f"File operation failed after {elapsed:.2f}s: {str(e)}")
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
+        elapsed = time.time() - start_time
+        logger.error(f"Unexpected error after {elapsed:.2f}s: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Unexpected error: {str(e)}")
 
 
@@ -1384,5 +1407,11 @@ if __name__ == "__main__":
         app,
         host="0.0.0.0",
         port=8000,
-        log_level="info"
+        log_level="info",
+        timeout_keep_alive=30,
+        timeout_graceful_shutdown=10,
+        # Prevent hanging connections from blocking the server
+        limit_concurrency=100,
+        # Add request timeout to prevent indefinite hangs
+        timeout_notify=30
     ) 
