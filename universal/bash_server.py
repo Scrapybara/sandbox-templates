@@ -644,25 +644,25 @@ class BashTool(BaseAnthropicTool):
             except Exception as e:
                 return ToolResult(error=f"Failed to restart session {session_id}: {str(e)}")
             
-        if session is None and command is not None:
-            session_id = 1
-            while True:
-                if session_id not in self._sessions:
-                    session = session_id
-                    break
-                
-                await self._sessions[session_id].check_command_completion()
-                if not self._sessions[session_id].is_running_command:
-                    session = session_id
-                    break
-                
-                session_id += 1
-        
-        session = session if session is not None else 1
-            
         created_msg = None
         try:
             async with self._sessions_lock:
+                if session is None and command is not None:
+                    session_id = 1
+                    while True:
+                        if session_id not in self._sessions:
+                            session = session_id
+                            break
+                        
+                        if session_id in self._sessions and not self._sessions[session_id].is_running_command:
+                            session = session_id
+                            break
+                        
+                        session_id += 1
+                
+                session = session if session is not None else 1
+                
+                # Create session if it doesn't exist
                 if session not in self._sessions:
                     self._sessions[session] = _BashSession(session_id=session)
                     await self._sessions[session].start()
