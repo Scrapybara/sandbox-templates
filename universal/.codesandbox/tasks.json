@@ -24,6 +24,18 @@
         "resume": false
       }
     },
+    "code-server": {
+      "name": "start code-server",
+      "command": "code-server --bind-addr 0.0.0.0:8080 --auth none /project/workspace",
+      "runAtStart": true,
+      "preview": {
+        "port": 8080
+      },
+      "restartOn": {
+        "clone": false,
+        "resume": false
+      }
+    },
     "init-git": {
       "name": "initialize .gitscout git repo",
       "command": "cd /project/workspace && git init --bare .gitscout && git --git-dir=/project/workspace/.gitscout --work-tree=. config user.email 'scout@scout.new' && git --git-dir=/project/workspace/.gitscout --work-tree=. config user.name 'Scout'",

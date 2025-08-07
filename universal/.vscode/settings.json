@@ -1,0 +1,26 @@
+{
+  "files.exclude": {
+    "lsp.py": true,
+    "bash_server.py": true,
+    "README.md": true,
+    ".codesandbox": true,
+    ".devcontainer": true,
+    ".gitscout": true,
+    "**/__pycache__": true
+  },
+  "search.exclude": {
+    "lsp.py": true,
+    "bash_server.py": true,
+    "README.md": true,
+    ".codesandbox": true,
+    ".devcontainer": true,
+    ".gitscout": true,
+    "**/__pycache__": true
+  },
+  "files.watcherExclude": {
+    ".codesandbox/**": true,
+    ".devcontainer/**": true,
+    ".gitscout/**": true,
+    "**/__pycache__/**": true
+  }
+}

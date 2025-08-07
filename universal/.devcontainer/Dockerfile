@@ -46,6 +46,9 @@ RUN apt update && \
     apt-get clean && \
     rm -rf /var/lib/apt/lists/*
 
+# Install code-server
+RUN curl -fsSL https://code-server.dev/install.sh | sh
+
 # The project will be mounted in /workspace by default
 
 # Every new shell will open inside the built container
