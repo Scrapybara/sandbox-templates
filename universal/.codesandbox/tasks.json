@@ -24,6 +24,13 @@
         "resume": false
       }
     },
+    "ttyd": {
+      "name": "start web terminal (ttyd)",
+      "command": "/usr/local/bin/ttyd -p 3010 bash",
+      "runAtStart": true,
+      "preview": { "port": 3010 },
+      "restartOn": { "clone": false, "resume": false }
+    },
     "code-server": {
       "name": "start code-server",
       "command": "code-server --bind-addr 0.0.0.0:8080 --auth none /project/workspace",
