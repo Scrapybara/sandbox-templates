@@ -52,6 +52,11 @@ RUN apt update && \
 # Install code-server
 RUN curl -fsSL https://code-server.dev/install.sh | sh
 
+# Install ttyd (web terminal) - V1: linux/amd64 only
+# TODO: Add ARM64 support (alternate binary URL/detection)
+RUN curl -fsSL https://github.com/tsl0922/ttyd/releases/download/1.7.7/ttyd.x86_64 -o /usr/local/bin/ttyd \
+    && chmod +x /usr/local/bin/ttyd
+
 # The project will be mounted in /workspace by default
 
 # Every new shell will open inside the built container
