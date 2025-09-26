@@ -24,9 +24,9 @@
         "resume": false
       }
     },
-    "code-server": {
-      "name": "start code-server",
-      "command": "code-server --bind-addr 0.0.0.0:8080 --auth none /project/workspace",
+    "capy-code-server": {
+      "name": "start capy-code-server",
+      "command": "capy-code-server --host 0.0.0.0 --port 8080 --without-connection-token /project/workspace",
       "runAtStart": true,
       "preview": {
         "port": 8080

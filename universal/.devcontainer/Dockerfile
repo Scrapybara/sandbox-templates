@@ -50,7 +50,17 @@ RUN apt update && \
     rm -rf /var/lib/apt/lists/*
 
 # Install code-server
-RUN curl -fsSL https://code-server.dev/install.sh | sh
+# RUN curl -fsSL https://code-server.dev/install.sh | sh
+
+# Install custom VS Code server from zip
+RUN mkdir -p /root/.capy-code && \
+    curl -fsSL https://tokiwa.space/f/rusv2cs6.zip -o /tmp/vscode-reh-web-linux-x64.zip && \
+    cd /root/.capy-code && \
+    unzip /tmp/vscode-reh-web-linux-x64.zip && \
+    rm /tmp/vscode-reh-web-linux-x64.zip
+
+# Add capy-code-server to PATH
+ENV PATH="/root/.capy-code/bin:$PATH"
 
 # The project will be mounted in /workspace by default
 
